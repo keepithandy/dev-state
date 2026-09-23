@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import stat
 
 GENERATED_REPORT_HEADERS = (
     "# dev-kit Audit Report",
@@ -11,19 +12,45 @@ GENERATED_REPORT_HEADERS = (
 )
 
 
-def path_uses_link_or_junction(path_value: str | Path) -> bool:
-    """Return True when resolving the path changes its lexical absolute location.
+def _is_reparse_point(path: Path) -> bool:
+    """Return True for Windows reparse points without requiring Python 3.12."""
 
-    On POSIX this catches symlinked path components. On Windows, ``realpath`` also
-    resolves junction/reparse-point components supported by the Python runtime.
-    Missing leaf paths are allowed; existing linked parent components are still
-    detected.
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if not reparse_flag:
+        return False
+
+    try:
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attributes & reparse_flag)
+
+
+def path_uses_link_or_junction(path_value: str | Path) -> bool:
+    """Return True when an existing path component is a symlink or junction.
+
+    The check walks lexical path components instead of comparing ``abspath`` with
+    ``realpath``. That avoids false positives caused by Windows path spelling or
+    short-name normalization while still detecting POSIX symlinks and Windows
+    reparse-point/junction components. Missing leaf paths are allowed.
     """
 
-    expanded = os.fspath(Path(path_value).expanduser())
-    lexical = os.path.normcase(os.path.abspath(expanded))
-    resolved = os.path.normcase(os.path.realpath(expanded))
-    return lexical != resolved
+    current = Path(os.path.abspath(os.fspath(Path(path_value).expanduser())))
+
+    while True:
+        if current.exists():
+            try:
+                if current.is_symlink() or _is_reparse_point(current):
+                    return True
+            except OSError:
+                pass
+
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    return False
 
 
 def path_is_within(path: Path, root: Path) -> bool:
