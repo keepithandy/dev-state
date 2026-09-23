@@ -17,6 +17,7 @@ from .auditors import (
     resolve_audit_profile,
     summarize,
 )
+from .path_safety import is_generated_report, path_is_within, path_uses_link_or_junction
 
 EXIT_SUCCESS = 0
 EXIT_AUDIT_FAILURE = 1
@@ -83,6 +84,15 @@ def _resolve_path(path_value: str) -> Path:
 
 
 def _validate_project_path(path_value: str) -> Path:
+    try:
+        if path_uses_link_or_junction(path_value):
+            raise DevKitCliError(
+                f"Project path crosses a symlink or junction; use the resolved project path directly: {path_value}",
+                EXIT_USAGE_ERROR,
+            )
+    except OSError as exc:
+        raise DevKitCliError(f"Could not inspect project path '{path_value}': {exc}", EXIT_USAGE_ERROR) from exc
+
     project_path = _resolve_path(path_value)
 
     try:
@@ -98,7 +108,16 @@ def _validate_project_path(path_value: str) -> Path:
     return project_path
 
 
-def _validate_output_path(path_value: str) -> Path:
+def _validate_output_path(path_value: str, protected_root: Path | None = None) -> Path:
+    try:
+        if path_uses_link_or_junction(path_value):
+            raise DevKitCliError(
+                f"Output path crosses a symlink or junction; use the resolved output path directly: {path_value}",
+                EXIT_USAGE_ERROR,
+            )
+    except OSError as exc:
+        raise DevKitCliError(f"Could not inspect output path '{path_value}': {exc}", EXIT_USAGE_ERROR) from exc
+
     output_path = _resolve_path(path_value)
     parent = output_path.parent
 
@@ -107,8 +126,20 @@ def _validate_output_path(path_value: str) -> Path:
             raise DevKitCliError(f"Output directory does not exist: {parent}", EXIT_USAGE_ERROR)
         if not parent.is_dir():
             raise DevKitCliError(f"Output parent is not a directory: {parent}", EXIT_USAGE_ERROR)
+        if output_path.exists() and not output_path.is_file():
+            raise DevKitCliError(f"Output path is not a file: {output_path}", EXIT_USAGE_ERROR)
         if not os.access(parent, os.W_OK):
             raise DevKitCliError(f"Output directory is not writable: {parent}", EXIT_RUNTIME_ERROR)
+        if (
+            protected_root is not None
+            and output_path.exists()
+            and path_is_within(output_path, protected_root)
+            and not is_generated_report(output_path)
+        ):
+            raise DevKitCliError(
+                f"Refusing to overwrite an existing project file with a report: {output_path}",
+                EXIT_USAGE_ERROR,
+            )
     except OSError as exc:
         raise DevKitCliError(f"Could not inspect output path '{output_path}': {exc}", EXIT_RUNTIME_ERROR) from exc
 
@@ -162,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "report":
             project_path = _validate_project_path(args.path)
-            output_path = _validate_output_path(args.output)
+            output_path = _validate_output_path(args.output, protected_root=project_path)
             results = audit_project(project_path, profile=args.profile)
             output_path.write_text(render_markdown(project_path, results), encoding="utf-8")
             print(f"Wrote report: {output_path}")
@@ -173,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
             summaries = audit_portfolio(parent_path)
             _print_portfolio_results(summaries)
             if args.output:
-                output_path = _validate_output_path(args.output)
+                output_path = _validate_output_path(args.output, protected_root=parent_path)
                 output_path.write_text(render_portfolio_markdown(parent_path, summaries), encoding="utf-8")
                 print(f"Wrote portfolio report: {output_path}")
             return _portfolio_exit_code(summaries)
